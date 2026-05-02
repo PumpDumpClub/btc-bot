@@ -239,9 +239,9 @@ async def main():
                 msg += "⚠️ Bukan financial advice. Selalu pakai SL!"
             else:
                 msg = (f"😴 {now}\n"
-                       f"Tidak ada sinyal kuat saat ini.\n"
-                       f"Bot tetap memantau 10 koin...\n"
-                       f"Sabar, tunggu setup sempurna! 🎯")
+                       f"Belum ada sinyal kuat bosku ini.\n"
+                       f"Tetap kita pantau ya ...\n"
+                       f"Cuan cuan cuan sempurna! 🎯")
 
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             print(f"[OK] {now} — {len(signals)} sinyal terkirim")
