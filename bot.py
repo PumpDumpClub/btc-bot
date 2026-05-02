@@ -1,19 +1,134 @@
 import os
 import asyncio
 import aiohttp
+import csv
 from datetime import datetime, timezone
 from telegram import Bot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
 SCHEDULE_MIN   = 15
-INTERVAL       = "15"
-LIMIT          = 100
+INTERVAL_LTF   = "15"
+INTERVAL_HTF   = "60"
+LIMIT          = 150
+LOG_FILE       = "trade_log.csv"
+SLIPPAGE       = 0.0005   # 0.05% simulasi slippage
+RISK_PCT       = 0.01     # Risk 1% per trade
+ACCOUNT_SIZE   = float(os.environ.get("ACCOUNT_SIZE", "100"))  # USD
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT"
 ]
+
+# ══════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════
+
+FIELDNAMES = [
+    "timestamp", "symbol", "direction",
+    "entry", "sl", "tp",
+    "sl_pct", "tp_pct", "rr",
+    "rsi", "volume", "htf_bias", "regime",
+    "result", "pnl_pct",
+    "highest_since_entry",  # P1: track real MFE
+    "lowest_since_entry",   # P1: track real MAE
+    "mae_pct", "mfe_pct",
+    "bars_held",
+    "position_size_usd"     # P5: position sizing
+]
+
+def init_log():
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+
+def log_signal(a):
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writerow({
+            "timestamp"          : datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "symbol"             : a["symbol"],
+            "direction"          : a["direction"],
+            "entry"              : a["entry"],
+            "sl"                 : a["sl"],
+            "tp"                 : a["tp"],
+            "sl_pct"             : a["sl_pct"],
+            "tp_pct"             : a["tp_pct"],
+            "rr"                 : a["rr"],
+            "rsi"                : a["rsi"],
+            "volume"             : a["vol"],
+            "htf_bias"           : a["bias"],
+            "regime"             : a["regime"],
+            "result"             : "OPEN",
+            "pnl_pct"            : "",
+            "highest_since_entry": a["entry"],  # mulai dari entry
+            "lowest_since_entry" : a["entry"],  # mulai dari entry
+            "mae_pct"            : 0,
+            "mfe_pct"            : 0,
+            "bars_held"          : 0,
+            "position_size_usd"  : a["position_size_usd"],
+        })
+
+def load_open_trades():
+    if not os.path.exists(LOG_FILE):
+        return []
+    with open(LOG_FILE, "r") as f:
+        return [dict(r) for r in csv.DictReader(f) if r["result"] == "OPEN"]
+
+def has_open_trade(symbol):
+    # P2: limit 1 trade per symbol
+    return any(t["symbol"] == symbol for t in load_open_trades())
+
+def update_trade(timestamp, symbol, updates):
+    rows = []
+    with open(LOG_FILE, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["timestamp"] == timestamp and row["symbol"] == symbol:
+                row.update(updates)
+            rows.append(row)
+    with open(LOG_FILE, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+def get_stats():
+    if not os.path.exists(LOG_FILE):
+        return None
+    with open(LOG_FILE, "r") as f:
+        rows = [r for r in csv.DictReader(f) if r["result"] in ("WIN", "LOSS", "EXPIRED")]
+    if not rows:
+        return None
+
+    wins   = [float(r["pnl_pct"]) for r in rows if r["result"] == "WIN"]
+    losses = [float(r["pnl_pct"]) for r in rows if r["result"] in ("LOSS", "EXPIRED")]
+    maes   = [float(r["mae_pct"]) for r in rows if r["mae_pct"]]
+    mfes   = [float(r["mfe_pct"]) for r in rows if r["mfe_pct"]]
+
+    total    = len(rows)
+    avg_win  = round(sum(wins)   / len(wins),   3) if wins   else 0
+    avg_loss = round(sum(losses) / len(losses), 3) if losses else 0
+    wr       = len(wins) / total
+
+    # Expectancy = (WR * avg_win) + ((1-WR) * avg_loss)
+    expectancy = round(wr * avg_win + (1 - wr) * avg_loss, 3)
+
+    return {
+        "total"      : total,
+        "wins"       : len(wins),
+        "losses"     : len(losses),
+        "winrate"    : round(wr * 100, 1),
+        "avg_win"    : avg_win,
+        "avg_loss"   : avg_loss,
+        "avg_mae"    : round(sum(maes) / len(maes), 3) if maes else 0,
+        "avg_mfe"    : round(sum(mfes) / len(mfes), 3) if mfes else 0,
+        "expectancy" : expectancy,
+    }
+
+# ══════════════════════════════════════════
+# DATA FETCH
+# ══════════════════════════════════════════
 
 async def fetch(url, params):
     try:
@@ -26,9 +141,10 @@ async def fetch(url, params):
         print(f"[FETCH ERROR] {e}")
         return None
 
-async def get_klines(symbol):
+async def get_klines(symbol, interval):
     data = await fetch("https://api.bybit.com/v5/market/kline",
-        {"category": "linear", "symbol": symbol, "interval": INTERVAL, "limit": LIMIT})
+        {"category": "linear", "symbol": symbol,
+         "interval": interval, "limit": LIMIT})
     if not data or "result" not in data:
         return None, None, None, None
     candles = data["result"]["list"]
@@ -38,12 +154,16 @@ async def get_klines(symbol):
     volumes = [float(c[5]) for c in reversed(candles)]
     return closes, highs, lows, volumes
 
-async def get_funding(symbol):
-    data = await fetch("https://api.bybit.com/v5/market/funding/history",
-        {"category": "linear", "symbol": symbol, "limit": 1})
+async def get_price(symbol):
+    data = await fetch("https://api.bybit.com/v5/market/tickers",
+        {"category": "linear", "symbol": symbol})
     if not data or "result" not in data:
-        return 0
-    return float(data["result"]["list"][0]["fundingRate"]) * 100
+        return None
+    return float(data["result"]["list"][0]["lastPrice"])
+
+# ══════════════════════════════════════════
+# INDIKATOR
+# ══════════════════════════════════════════
 
 def ma(data, period):
     return sum(data[-period:]) / period if len(data) >= period else 0
@@ -68,188 +188,43 @@ def atr(highs, lows, closes, period=14):
         trs.append(tr)
     return sum(trs) / len(trs) if trs else 0
 
-def ema(data, period):
-    if len(data) < period:
-        return 0
-    k = 2 / (period + 1)
-    val = sum(data[:period]) / period
-    for price in data[period:]:
-        val = price * k + val * (1 - k)
-    return val
+def volume_surge(volumes):
+    if len(volumes) < 20:
+        return 1
+    return volumes[-1] / (sum(volumes[-20:-1]) / 19)
 
-def macd(closes):
-    ema12 = ema(closes, 12)
-    ema26 = ema(closes, 26)
-    return ema12 - ema26
+# ══════════════════════════════════════════
+# MARKET STRUCTURE
+# ══════════════════════════════════════════
 
-def volume_trend(volumes):
-    # Volume 3 candle terakhir vs 10 candle sebelumnya
-    recent  = sum(volumes[-3:]) / 3
-    average = sum(volumes[-13:-3]) / 10
-    return recent / average if average > 0 else 1
+def market_regime(closes, highs, lows, atr_v):
+    price_range = max(highs[-20:]) - min(lows[-20:])
+    choppiness  = (atr_v * 20) / price_range if price_range > 0 else 1
+    atr_avg     = atr(highs, lows, closes, period=50)
+    if atr_v > atr_avg * 2.0:
+        return "SPIKE"
+    elif choppiness > 0.75:
+        return "SIDEWAYS"
+    return "TRENDING"
 
-def candle_strength(closes, highs, lows):
-    # Body candle terakhir vs shadow — makin besar makin kuat
-    body   = abs(closes[-1] - closes[-2])
-    shadow = highs[-1] - lows[-1]
-    return body / shadow if shadow > 0 else 0
+def htf_bias(closes_htf, ma50_htf):
+    price = closes_htf[-1]
+    if price > ma50_htf * 1.002:
+        return "UP"
+    elif price < ma50_htf * 0.998:
+        return "DOWN"
+    return "NEUTRAL"
 
-async def analyze(symbol):
-    closes, highs, lows, volumes = await get_klines(symbol)
-    if closes is None:
-        return None
-    funding  = await get_funding(symbol)
-    price    = closes[-1]
+def is_trending(ma20, ma50, ma99):
+    return ma20 > ma50 > ma99, ma20 < ma50 < ma99
 
-    # Indikator
-    ma7      = ma(closes, 7)
-    ma14     = ma(closes, 14)
-    ma25     = ma(closes, 25)
-    ma99     = ma(closes, 99)
-    rsi_v    = rsi(closes)
-    atr_v    = atr(highs, lows, closes)
-    macd_v   = macd(closes)
-    vol_ratio = volume_trend(volumes)
-    candle_s  = candle_strength(closes, highs, lows)
+def is_overextended(price, ma50, atr_v):
+    return abs(price - ma50) > atr_v * 3
 
-    # ── FILTER KETAT ─────────────────────────────────────
-    # Semua syarat HARUS terpenuhi untuk sinyal valid
-
-    score = 0
-    direction = None
-
-    # === LONG CONDITIONS ===
-    long_conditions = [
-        price > ma7 > ma14 > ma25 > ma99,   # Semua MA aligned bullish
-        rsi_v < 30,                           # RSI oversold ekstrem
-        macd_v > 0,                           # MACD positif
-        vol_ratio > 1.8,                      # Volume 80% di atas rata-rata
-        candle_s > 0.6,                       # Candle body kuat
-        funding < 0.005,                      # Funding tidak terlalu positif
-        closes[-1] > closes[-2] > closes[-3], # 3 candle naik berturut
-    ]
-
-    # === SHORT CONDITIONS ===
-    short_conditions = [
-        price < ma7 < ma14 < ma25 < ma99,   # Semua MA aligned bearish
-        rsi_v > 72,                           # RSI overbought ekstrem
-        macd_v < 0,                           # MACD negatif
-        vol_ratio > 1.8,                      # Volume 80% di atas rata-rata
-        candle_s > 0.6,                       # Candle body kuat
-        funding > -0.005,                     # Funding tidak terlalu negatif
-        closes[-1] < closes[-2] < closes[-3], # 3 candle turun berturut
-    ]
-
-    long_score  = sum(long_conditions)
-    short_score = sum(short_conditions)
-
-    # Minimum 6 dari 7 syarat harus terpenuhi
-    if long_score >= 6:
-        direction = "LONG"
-        score = long_score
-    elif short_score >= 6:
-        direction = "SHORT"
-        score = short_score
-    else:
-        return None  # Tidak lolos filter → tidak dikirim
-
-    # Hitung SL/TP berbasis ATR (lebih presisi dari persentase)
-    atr_multiplier_sl = 1.5
-    atr_multiplier_tp = 3.0  # RR 1:2
-
-    if direction == "LONG":
-        entry  = round(price, 6)
-        sl     = round(price - atr_v * atr_multiplier_sl, 6)
-        tp     = round(price + atr_v * atr_multiplier_tp, 6)
-        sl_pct = round((price - sl) / price * 100, 2)
-        tp_pct = round((tp - price) / price * 100, 2)
-    else:
-        entry  = round(price, 6)
-        sl     = round(price + atr_v * atr_multiplier_sl, 6)
-        tp     = round(price - atr_v * atr_multiplier_tp, 6)
-        sl_pct = round((sl - price) / price * 100, 2)
-        tp_pct = round((price - tp) / price * 100, 2)
-
-    # Estimasi berlaku berapa candle (timeframe 15m)
-    # ATR based — makin volatile makin cepat TP/SL kena
-    candles_estimate = round(atr_multiplier_tp / (atr_v / price * 100) * 0.5)
-    candles_estimate = max(2, min(candles_estimate, 12))
-    waktu_berlaku    = candles_estimate * 15  # dalam menit
-
-    return {
-        "symbol"   : symbol,
-        "price"    : price,
-        "direction": direction,
-        "entry"    : entry,
-        "sl"       : sl,
-        "tp"       : tp,
-        "sl_pct"   : sl_pct,
-        "tp_pct"   : tp_pct,
-        "rsi"      : round(rsi_v, 1),
-        "funding"  : round(funding, 4),
-        "vol_ratio": round(vol_ratio, 1),
-        "score"    : score,
-        "waktu"    : waktu_berlaku,
-        "atr"      : round(atr_v, 6),
-    }
-
-def format_signal(a):
-    emoji  = "🚀" if a["direction"] == "LONG" else "🔻"
-    bintang = "⭐" * (a["score"] - 5)  # 1-2 bintang
-    jam    = a["waktu"] // 60
-    menit  = a["waktu"] % 60
-    durasi = f"{jam}j {menit}m" if jam > 0 else f"{menit} menit"
-
-    return (
-        f"{emoji} {a['direction']} {a['symbol']} {bintang}\n"
-        f"{'━'*24}\n"
-        f"💰 Harga   : {a['price']}\n"
-        f"📍 Entry   : {a['entry']}\n"
-        f"🎯 TP      : {a['tp']} (+{a['tp_pct']}%)\n"
-        f"🛑 SL      : {a['sl']} (-{a['sl_pct']}%)\n"
-        f"⏱ Berlaku : ±{durasi}\n"
-        f"{'━'*24}\n"
-        f"📊 RSI     : {a['rsi']}\n"
-        f"📈 Volume  : {a['vol_ratio']}x rata-rata\n"
-        f"💸 Funding : {a['funding']}%\n"
-        f"🎯 Score   : {a['score']}/7 syarat terpenuhi\n"
-    )
-
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    print(f"✅ Bot started — filter ketat, {len(SYMBOLS)} koin, tiap {SCHEDULE_MIN} menit")
-
-    while True:
-        try:
-            now     = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            signals = []
-
-            for symbol in SYMBOLS:
-                result = await analyze(symbol)
-                if result:
-                    signals.append(result)
-                await asyncio.sleep(2)
-
-            if signals:
-                # Urutkan by score tertinggi
-                signals.sort(key=lambda x: x["score"], reverse=True)
-                msg = f"🔥 SINYAL KUAT — {now}\n\n"
-                for s in signals:
-                    msg += format_signal(s) + "\n"
-                msg += "⚠️ Bukan financial advice. Selalu pakai SL!"
-            else:
-                msg = (f"😴 {now}\n"
-                       f"Belum ada sinyal kuat bosku ini.\n"
-                       f"Tetap kita pantau ya ...\n"
-                       f"Cuan cuan cuan sempurna! 🎯")
-
-            await bot.send_message(chat_id=CHAT_ID, text=msg)
-            print(f"[OK] {now} — {len(signals)} sinyal terkirim")
-
-        except Exception as e:
-            print(f"[ERROR] {e}")
-
-        await asyncio.sleep(SCHEDULE_MIN * 60)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+def find_fractal_lows(lows, lookback=40):
+    fractals = []
+    for i in range(2, len(lows) - 2):
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and \
+           lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            fractals.append(lows[i])
+    recent = [f
